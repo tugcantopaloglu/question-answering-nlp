@@ -1,67 +1,81 @@
-# Evaluating Turkish BERT for Semantic Similarity in Question Answering
+# Evaluating Turkish BERT for Answer Retrieval
 
-## Overview
+This research project evaluates whether question embeddings retrieve their paired answers from a fixed candidate pool. It uses the pretrained [dbmdz/bert-base-turkish-cased](https://huggingface.co/dbmdz/bert-base-turkish-cased) model and [merve/turkish_instructions](https://huggingface.co/datasets/merve/turkish_instructions). It performs inference and cosine ranking; it does not train a model or generate answers.
 
-This project evaluates the performance of the `dbmdz/bert-base-turkish-cased` model on a Turkish question-answering task. The primary goal is to assess the model's ability to understand semantic similarity by generating embeddings for questions and their corresponding answers. The evaluation is based on retrieving the correct answer from a pool of candidates using cosine similarity between the embeddings.
+The original work by Tuğcan Topaloğlu is preserved in [ana_kod_tugcantopaloglu.ipynb](ana_kod_tugcantopaloglu.ipynb), the model-specific notebooks under `Modellere Özel Aynı Kod ama Tek Tek`, and the saved plots under `Model Grafikleri`. The Python script is the maintained command-line version. The notebooks retain their original Colab installation commands, CUDA assumptions, and recorded outputs.
 
-The performance is measured by top-1 and top-5 success rates. Additionally, the project includes t-SNE visualizations to explore the separability of question and answer embeddings in a lower-dimensional space.
+## Setup
 
-## Dataset
+Use Python 3.10 or newer in a virtual environment. CPU inference is supported; a compatible PyTorch CUDA installation enables GPU inference. Downloading the dataset and pretrained model requires network access, local disk space, and substantially more time and memory than the fixture tests.
 
-The project utilizes the `merve/turkish_instructions` dataset from the Hugging Face Datasets library. This dataset consists of instructional prompts, inputs, and corresponding outputs in Turkish.
+```bash
+python -m venv .venv
+```
 
-For this task, a random sample of 1000 instruction-input pairs (as questions) and their corresponding outputs (as answers) are selected from the original dataset.
+Activate it with `source .venv/bin/activate` on Linux/macOS or `.venv\Scripts\Activate.ps1` in Windows PowerShell, then install:
 
-## Methodology
+```bash
+python -m pip install -r requirements.txt
+python ana_kod_tugcantopaloglu.py --help
+```
 
-The project follows these steps:
+For a CPU-only PyTorch wheel, install `torch` from the [official PyTorch CPU index](https://download.pytorch.org/whl/cpu) before installing the requirements:
 
-1.  **Data Loading and Preprocessing**: The `merve/turkish_instructions` dataset is loaded. A random sample of 1000 question-answer pairs is created by combining the 'talimat' (instruction) and 'giriş' (input) fields to form the questions, and using the 'çıktı' (output) field for the answers. This subset is then saved to a CSV file (`selected_questions_answers.csv`) for consistent use.
-2.  **Model Selection**: The pre-trained `dbmdz/bert-base-turkish-cased` model is used for generating text embeddings. This model is a cased BERT model specifically trained on a large corpus of Turkish text.
-3.  **Embedding Generation**: Vector representations (embeddings) of the questions and answers are generated using the selected BERT model. The embeddings are derived from the last hidden state of the model's output, specifically the representation of the `[CLS]` token.
-4.  **Similarity Calculation**: The cosine similarity between the embeddings of a question and all candidate answers is calculated. Cosine similarity measures the cosine of the angle between two non-zero vectors, providing a score of how similar the texts are in meaning.
-5.  **Evaluation Metrics**: The model's performance is evaluated based on the following metrics:
-    * **Top-1 Success Rate**: The percentage of questions for which the correct answer is the most similar (highest cosine similarity).
-    * **Top-5 Success Rate**: The percentage of questions for which the correct answer is among the top 5 most similar answers.
-6.  **Visualization**: t-SNE (t-Distributed Stochastic Neighbor Embedding) is used to visualize the high-dimensional question and answer embeddings in a 2D space. A scatter plot is generated to visually inspect the clustering and separability of questions and answers.
+```bash
+python -m pip install "torch>=2.6,<3" --index-url https://download.pytorch.org/whl/cpu
+```
 
-## Code Description
+Optional plots require `python -m pip install -r requirements-plot.txt`. Importing the script or running `--help` does not load the dataset or model and works without the ML dependencies.
 
-The Jupyter Notebook `ana_kod_tugcantopaloglu.ipynb` contains the complete code for this project. The key functions are:
+## Run an evaluation
 
--   **`get_model_and_tokenizer(model_name)`**: Loads the pre-trained model and its corresponding tokenizer from the Hugging Face Hub and moves the model to the GPU ("cuda") for faster computation.
--   **`get_embeddings(texts, tokenizer, model)`**: Takes a list of texts and returns their embeddings.
--   **`get_embeddings_in_batches(texts, tokenizer, model, batch_size=64)`**: A batch-processing version of `get_embeddings` for more efficient embedding generation of a large number of texts.
--   **`calculate_similarity(embedding1, embedding2)`**: Computes the cosine similarity between two embeddings.
--   **`calculate_top_k_success(questions, answers, tokenizer, model, k=5)`**: Calculates the top-1 and top-5 success rates for the given model on the provided questions and answers.
--   **`plot_tsne(embeddings, labels, title)`**: Applies t-SNE to the embeddings and generates a 2D scatter plot.
+To select 1,000 paired rows deterministically, save them for reuse, and record the metrics:
 
-## How to Run
+```bash
+python ana_kod_tugcantopaloglu.py --sample-size 1000 --seed 42 --batch-size 16 --save-csv selected_questions_answers.csv --output-json retrieval-results.json
+```
 
-1.  **Environment Setup**: Ensure you have Python 3 and a GPU-enabled environment for optimal performance.
-2.  **Install Dependencies**:
-    ```bash
-    pip install datasets transformers torch scikit-learn matplotlib pandas
-    ```
-3.  **Execute the Notebook**: Run the cells in the `ana_kod_tugcantopaloglu.ipynb` Jupyter Notebook sequentially.
+The default device is `auto`, which uses CUDA when available and otherwise CPU. Add `--device cpu` to force CPU inference. Reduce `--batch-size` if memory is limited. A smaller `--sample-size`, such as 10, is suitable for a smoke run, but its scores are not comparable to a 1,000-candidate experiment.
 
-## Results
+To reuse every row of an existing UTF-8 CSV with `Question` and `Answer` columns:
 
-The `dbmdz/bert-base-turkish-cased` model was evaluated on the 1000 sampled question-answer pairs. The achieved success rates are:
+```bash
+python ana_kod_tugcantopaloglu.py --csv selected_questions_answers.csv --device cpu --batch-size 16 --output-json retrieval-results.json
+```
 
--   **Top-1 Success Rate**: 3.50%
--   **Top-5 Success Rate**: 4.90%
+`--sample-size` and `--seed` control dataset sampling; CSV mode preserves its rows and order. `--seed` also seeds PyTorch. The default model is pinned to `b6e1de16c983e0f2c70664591ea3f22810072608` and the default dataset to `ed3381a23d9328b02054456d8ca5bdc157f617d5`. Remote overrides require `--model-revision` or `--dataset-revision` with a full 40-character Hub commit hash; local directories do not require a revision. The result JSON records the model revision when available, source information, ordered-pair SHA-256 digest, device, effective token limit, pooling method, candidate count, and rates in the range 0 to 1. Dependencies are compatible version ranges rather than an experiment lockfile; save the environment versions with your results. A fixed seed does not guarantee identical floating-point results across devices or library versions.
 
-The t-SNE visualization shows the distribution of question and answer embeddings in a 2D space, providing a qualitative assessment of their semantic separability.
+`--local-files-only` applies to the model and tokenizer. Use it with `--csv` for a run that does not need a dataset download; the model must already be cached or supplied as a local directory with `--model`. No custom Hub Python code is enabled. A model override must support the BERT-style leading-token representation and positional limit used by this script. Other embedding models may require different pooling, prompts, or normalization, so simply changing `--model` is not a valid comparison for every architecture.
 
-## Future Work
+To save a t-SNE plot, install the plotting requirements and add `--plot retrieval-tsne.png`. Plotting reuses the evaluated embeddings and adds computation. It adapts perplexity to small samples, and it is a qualitative visualization rather than an evaluation metric.
 
-As mentioned in the notebook, the initial plan was to evaluate several other models for this task. The code is structured to be easily adaptable for different models. The next steps would involve running the evaluation in parallel for the following models to compare their performance:
+## Data and evaluation contract
 
--   `KaLM-embedding-multilingual-mini-v1`
--   `pingkeest/learning2_model`
--   `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`
--   `Alibaba-NLP/gte-multilingual-base`
--   `Alibaba-NLP/gte-large-en-v1.5`
+The source notebook records dataset columns `talimat`, ` giriş`, and ` çıktı`, including the leading spaces. The script strips column-name whitespace and combines instruction and optional input into each question. It rejects ambiguous columns, missing or blank questions/answers, and invalid sample sizes instead of silently dropping rows. CSV loading preserves Turkish text, quoted newlines, and literal strings such as `NA`.
 
-Additionally, the notebook has a variation for predicting the question from the answer, which can be another interesting direction for future experiments.
+The tokenizer uses padding and truncation, with a default maximum of 512 tokens bounded by the tokenizer and model positional limits. Embeddings are the last hidden state's leading `[CLS]` vector. Inference disables dropout and gradient recording, encodes each question and answer once in batches, and returns embeddings to CPU before cosine ranking. Ranking itself operates in question batches.
+
+The correct answer is the answer at the same row index as the question. Top-1 counts exact first-place retrieval; top-k counts inclusion among the first k candidates, capped at the candidate-pool size. Ties use ascending candidate row order. Duplicate answer strings remain separate candidates, so an equivalent answer at another index does not count as correct. These are paired-row retrieval rates, not human judgments of answer correctness or general semantic similarity. Empty, nonfinite, zero-norm, or misaligned embeddings are rejected.
+
+## Historical results
+
+The saved main notebook reports **top-1: 3.50%** and **top-5: 4.90%** for `dbmdz/bert-base-turkish-cased` on its randomly selected 1,000 pairs. These are historical outputs, not a newly reproduced benchmark. The exact sampled CSV, sampling seed, and pinned model/dataset revisions are not committed, and the original code leaves dropout enabled. The maintained script corrects that behavior; its results must be reported as a separate run with its own saved sample and environment.
+
+The repository also contains notebooks or plots for `HIT-TMG/KaLM-embedding-multilingual-mini-v1`, `pingkeest/learning2_model`, `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`, `Alibaba-NLP/gte-multilingual-base`, and `Alibaba-NLP/gte-large-en-v1.5`. Those artifacts preserve the original experiments and do not establish that this script implements each model's recommended embedding pipeline. Some notebooks also explore answer-to-question retrieval.
+
+## Local validation
+
+```bash
+python -m pip install -r requirements-dev.txt -r requirements-plot.txt
+python -m unittest discover -s tests -v
+python -m bandit ana_kod_tugcantopaloglu.py --skip B311
+python -m pip_audit --progress-spinner off
+```
+
+Tests create a tiny randomly initialized BERT and Turkish tokenizer entirely in a temporary local directory. They check CPU loading, token limits, disabled dropout, batched inference, paired-row cosine ranking, invalid data, Unicode CSV round trips, CLI result metadata, and small t-SNE plots. These fixtures test execution and evaluation logic; their scores say nothing about the pretrained model's accuracy. CI sets the Hugging Face offline flags and runs the same fixtures and security checks without downloading weights or datasets.
+
+Bandit's B311 rule is excluded explicitly because the seeded pseudo-random generator selects reproducible research rows and is not used for security tokens or cryptography. Other Bandit checks remain enabled, including checks for unsafe Hub downloads.
+
+## License
+
+The project is distributed under the [MIT license](LICENSE). The referenced datasets and pretrained models retain their own terms and attribution.

@@ -1,215 +1,259 @@
-# -*- coding: utf-8 -*-
-"""
-Merhaba bu kod tüm eğitimleri içeren ana kod'um ancak daha saonra eğitimleri paralel olarak yapabilmek adına aynı kodu bir kaç defa daha oluşturdum ekstra olarak bu kodları da dosyaya ekliyorum. Diğer kodların buradaki koddan herhangi bir farkı bulunmuyor sadece model ismi değişiyor ve/veya sorudan cevap değil de cevaptan soru tahmini yapıyor. Tüm ana kod'umu bu dosyada bulabilirsiniz.
+"""Turkish BERT answer retrieval, adapted from Tuğcan Topaloğlu's notebook."""
 
-Saygılarımla,
-Tuğcan Topaloğlu
-"""
-
-!pip install datasets
-
-from datasets import load_dataset
-
-# Turkish Instructions veri setini yükleyin
-dataset = load_dataset("merve/turkish_instructions")
-
-# Veri setindeki örnekleri incelemek
-print(dataset['train'])
-
+import argparse
+import csv
+import hashlib
+import json
 import random
+import re
+from pathlib import Path
 
-# Sorular ve cevapları içeren listeler
-questions = []
-answers = []
-# veri seti " giriş" " çıktı" şeklinde key üretiyor
-# Veri setinden soruları ve cevapları ayırma
-for example in dataset['train']:
-    instruction = example['talimat']
-    input_text = example[' giriş']
-    response = example[' çıktı']
 
-    # Soru oluşturma (talimat + giriş)
-    question = f"{instruction} {input_text}".strip()
-    answer = response.strip()
+MODEL_NAME = "dbmdz/bert-base-turkish-cased"
+DATASET_NAME = "merve/turkish_instructions"
+MODEL_REVISION = "b6e1de16c983e0f2c70664591ea3f22810072608"
+DATASET_REVISION = "ed3381a23d9328b02054456d8ca5bdc157f617d5"
 
-    # Listelere ekleme
-    questions.append(question)
-    answers.append(answer)
 
-# 1000 adet rasgele soru-cevap seçimi
-random_indices = random.sample(range(len(questions)), 1000)
-selected_questions = [questions[i] for i in random_indices]
-selected_answers = [answers[i] for i in random_indices]
+def _asset_revision(name, revision, default_name, default_revision):
+    if Path(name).is_dir():
+        return None
+    if revision is None and name == default_name:
+        revision = default_revision
+    if not isinstance(revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
+        raise ValueError("Remote models and datasets require a full 40-character commit revision.")
+    return revision
 
-import pandas as pd
 
-# Seçilen sorular ve cevapları bir veri çerçevesine dönüştürme
-data = {
-    "Question": selected_questions,
-    "Answer": selected_answers
-}
-df = pd.DataFrame(data)
+def _validate_pairs(questions, answers):
+    if not questions or len(questions) != len(answers):
+        raise ValueError("Questions and answers must be nonempty and have equal lengths.")
+    if any(not isinstance(text, str) or not text.strip() for text in [*questions, *answers]):
+        raise ValueError("Every question and answer must be a nonempty string.")
 
-# CSV dosyasına kaydetme
-csv_file_path = "selected_questions_answers.csv"
-df.to_csv(csv_file_path, index=False)
 
-print(f"Rastgele seçilen 1000 soru ve cevap '{csv_file_path}' dosyasına kaydedildi.")
+def select_question_answer_pairs(records, sample_size=1000, seed=42):
+    questions, answers = [], []
+    for index, record in enumerate(records):
+        fields = {key.strip(): value for key, value in record.items()}
+        if len(fields) != len(record):
+            raise ValueError(f"Row {index} has conflicting column names after stripping spaces.")
+        instruction = fields.get("talimat")
+        input_text = fields.get("giriş", "")
+        response = fields.get("çıktı")
+        if input_text is None:
+            input_text = ""
+        if not all(isinstance(value, str) for value in (instruction, input_text, response)):
+            raise ValueError(f"Row {index} requires string talimat, giriş and çıktı fields.")
+        questions.append(f"{instruction} {input_text}".strip())
+        answers.append(response.strip())
+    _validate_pairs(questions, answers)
+    if sample_size <= 0 or sample_size > len(questions):
+        raise ValueError(f"Sample size must be between 1 and {len(questions)}.")
+    indices = random.Random(seed).sample(range(len(questions)), sample_size)
+    return [questions[index] for index in indices], [answers[index] for index in indices]
 
-from datasets import Dataset
-import pandas as pd
-df = pd.read_csv("selected_questions_answers.csv")
-dataset = Dataset.from_pandas(df)
-selected_questions = dataset['Question']
-selected_answers = dataset['Answer']
 
-# ornek soru ve cevap
-print("Örnek Soru:", selected_questions[999])
-print("Örnek Cevap:", selected_answers[999])
+def load_question_answer_csv(path):
+    with Path(path).open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if reader.fieldnames is None or not {"Question", "Answer"}.issubset(reader.fieldnames):
+            raise ValueError("CSV must contain Question and Answer columns.")
+        if len(set(reader.fieldnames)) != len(reader.fieldnames):
+            raise ValueError("CSV column names must be unique.")
+        rows = list(reader)
+    if any(None in row for row in rows):
+        raise ValueError("CSV rows must not contain extra fields.")
+    questions = [row["Question"] for row in rows]
+    answers = [row["Answer"] for row in rows]
+    _validate_pairs(questions, answers)
+    return questions, answers
 
-from transformers import AutoTokenizer, AutoModel
-import torch
 
-# modeli yükleme ve vektör çıkartma
-def get_model_and_tokenizer(model_name):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to("cuda")
+def save_question_answer_csv(path, questions, answers):
+    _validate_pairs(questions, answers)
+    with Path(path).open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["Question", "Answer"])
+        writer.writerows(zip(questions, answers))
+
+
+def get_model_and_tokenizer(model_name, device="auto", revision=None, local_files_only=False):
+    revision = _asset_revision(model_name, revision, MODEL_NAME, MODEL_REVISION)
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is unavailable; use --device cpu.")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, revision=revision, local_files_only=local_files_only, trust_remote_code=False)
+    model = AutoModel.from_pretrained(model_name, revision=revision, local_files_only=local_files_only, trust_remote_code=False).to(device)
+    model.eval()
     return tokenizer, model
 
-# temsil çıkarma işlevi
-def get_embeddings(texts, tokenizer, model):
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to('cuda')
-    with torch.no_grad():
-        outputs = model(**inputs)
-    return outputs.last_hidden_state[:, 0, :]
 
-def get_embeddings_in_batches(texts, tokenizer, model, batch_size=64):
+def get_embeddings(texts, tokenizer, model, max_length=512):
+    return get_embeddings_in_batches(texts, tokenizer, model, batch_size=len(texts), max_length=max_length)
+
+
+def get_embeddings_in_batches(texts, tokenizer, model, batch_size=64, max_length=512):
+    import torch
+
+    if batch_size <= 0 or max_length <= 0:
+        raise ValueError("Batch size and maximum token length must be positive.")
+    if not texts or any(not isinstance(text, str) or not text.strip() for text in texts):
+        raise ValueError("Texts must be a nonempty sequence of nonempty strings.")
+    limits = [max_length, tokenizer.model_max_length, model.config.max_position_embeddings]
+    token_limit = min(limits)
+    model.eval()
     embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i+batch_size]
-        inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True).to('cuda')
-        with torch.no_grad():
+    with torch.inference_mode():
+        for start in range(0, len(texts), batch_size):
+            inputs = tokenizer(
+                list(texts[start:start + batch_size]), return_tensors="pt",
+                padding=True, truncation=True, max_length=token_limit,
+            )
+            inputs = {name: value.to(model.device) for name, value in inputs.items()}
             outputs = model(**inputs)
-        batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu()  # GPU'dan CPU'ya taşıyoruz
-        embeddings.append(batch_embeddings)
+            embeddings.append(outputs.last_hidden_state[:, 0, :].cpu())
     return torch.cat(embeddings)
 
-# ornek model ve tokenizer yükleme
-tokenizer, model = get_model_and_tokenizer("dbmdz/bert-base-turkish-cased")
 
-# ornek temsiller çıkarma
-embeddings = get_embeddings(selected_questions[:10], tokenizer, model)
-print("Örnek Embedding Boyutu:", embeddings.shape)
+def _normalized_embeddings(embeddings):
+    import numpy as np
 
-from scipy.spatial.distance import cosine
-import numpy as np
+    values = np.asarray(embeddings, dtype=np.float64)
+    if values.ndim != 2 or not all(values.shape) or not np.isfinite(values).all():
+        raise ValueError("Embeddings must be a nonempty, finite two-dimensional array.")
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    if not np.isfinite(norms).all() or (norms == 0).any():
+        raise ValueError("Embeddings must have finite, nonzero norms.")
+    return values / norms
 
-# kosinus benzerliğini hesaplama işlevi
+
 def calculate_similarity(embedding1, embedding2):
-    # kosinus mesafesi benzerliğin tersi oldugundan bu nedenle 1-cosine(embedding1, embedding2) olarak hesaplıyoruz
-    similarity = 1 - cosine(embedding1, embedding2)
-    return similarity
+    import numpy as np
 
-# ornek olarak ilk 10 soru ve cevap arasındaki benzerlikleri hesaplayalım
-for i in range(10):
-    question_embedding = embeddings[i].cpu().numpy()
-    answer_embedding = get_embeddings([selected_answers[i]], tokenizer, model)[0].cpu().numpy()
+    left, right = np.asarray(embedding1), np.asarray(embedding2)
+    if left.ndim != 1 or right.ndim != 1 or left.shape != right.shape:
+        raise ValueError("Similarity requires two vectors of equal length.")
+    vectors = _normalized_embeddings([left, right])
+    return float(vectors[0] @ vectors[1])
 
-    similarity = calculate_similarity(question_embedding, answer_embedding)
-    print(f"Soru {i + 1} ve Cevap {i + 1} arasındaki benzerlik: {similarity:.4f}")
 
-# top-1 ve top-5 başarı oranı hesaplama islevi
-def calculate_top_k_success(questions, answers, tokenizer, model, k=5):
-    top1_count = 0
-    top5_count = 0
+def evaluate_embeddings(question_embeddings, answer_embeddings, k=5, batch_size=64):
+    import numpy as np
 
-    for idx, question in enumerate(questions):
-        question_embedding = get_embeddings([question], tokenizer, model)[0].cpu().numpy()
+    if k <= 0 or batch_size <= 0:
+        raise ValueError("Top-k and batch size must be positive.")
+    questions = _normalized_embeddings(question_embeddings)
+    answers = _normalized_embeddings(answer_embeddings)
+    if questions.shape != answers.shape:
+        raise ValueError("Question and answer embeddings must have matching shapes and row order.")
+    candidate_count = len(answers)
+    top1_count, topk_count = 0, 0
+    for start in range(0, len(questions), batch_size):
+        scores = questions[start:start + batch_size] @ answers.T
+        ranked = np.argsort(-scores, axis=1, kind="stable")[:, :min(k, candidate_count)]
+        expected = np.arange(start, start + len(ranked))
+        top1_count += int((ranked[:, 0] == expected).sum())
+        topk_count += int((ranked == expected[:, None]).any(axis=1).sum())
+    return top1_count / candidate_count, topk_count / candidate_count
 
-        # tum cevapların embedding'lerini hesaplayalım
-        answer_embeddings = get_embeddings(answers, tokenizer, model).cpu().numpy()
 
-        # soru ile her bir cevap arasındaki benzerlik skorunu hesaplayalım
-        similarities = [calculate_similarity(question_embedding, answer) for answer in answer_embeddings]
+def calculate_top_k_success(questions, answers, tokenizer, model, k=5, batch_size=64, max_length=512):
+    _validate_pairs(questions, answers)
+    question_embeddings = get_embeddings_in_batches(questions, tokenizer, model, batch_size, max_length)
+    answer_embeddings = get_embeddings_in_batches(answers, tokenizer, model, batch_size, max_length)
+    return evaluate_embeddings(question_embeddings, answer_embeddings, k=k, batch_size=batch_size)
 
-        # skorlari büyükten küçüğe sıralayalım ve en benzer ilk k cevapları bulalım
-        sorted_indices = np.argsort(similarities)[::-1]
-        top_k_indices = sorted_indices[:k]
 
-        # gercek cevabın indeksi k içerisinde ise sayacı arttıralım
-        # idx = index
-        if idx in top_k_indices:
-            top5_count += 1
-            if top_k_indices[0] == idx:
-                top1_count += 1
-        # ilk seferde calisip calismadigindan emin olmak icin step sayaci koydum bundan sonraki tum modellerde bu sayaci 50 ser 50 ser arttiriyorum cok fazla otuput olmamasi icin
-        print('Step Complete - Index:',idx)
-    top1_success_rate = top1_count / len(questions)
-    top5_success_rate = top5_count / len(questions)
+def plot_tsne(embeddings, labels, title, output_path=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from sklearn.manifold import TSNE
 
-    return top1_success_rate, top5_success_rate
+    values = np.asarray(embeddings)
+    _normalized_embeddings(values)
+    if len(values) < 2 or values.shape[1] < 2 or len(values) != len(labels):
+        raise ValueError("t-SNE requires at least two vectors, two dimensions, and one label per vector.")
+    reduced = TSNE(n_components=2, random_state=42, perplexity=min(30, len(values) - 1)).fit_transform(values)
+    colors = ["blue" if label == "question" else "red" for label in labels]
+    figure, axis = plt.subplots(figsize=(10, 8))
+    axis.scatter(reduced[:, 0], reduced[:, 1], c=colors, alpha=0.5)
+    axis.set(title=title, xlabel="t-SNE Dim 1", ylabel="t-SNE Dim 2")
+    if output_path is None:
+        plt.show()
+    else:
+        figure.savefig(output_path, bbox_inches="tight")
+    plt.close(figure)
 
-# Model 1 - KaLM-embedding-multilingual-mini-v1
-# Model 2 - pingkeest/learning2_model
-# Model 3 - gte-multilingual-base
-# Model 4 - Alibaba-NLP/gte-multilingual-base
-# Model 5 - Alibaba-NLP/gte-large-en-v1.5
-# Model 6 - dbmdz/bert-base-turkish-cased
 
-# kullanilacak model isimlerinin listesi
-# ilk basta planim sirayla modelleri calistirmakti ancak uzun surmesinden oturu paralel olarak modelleri boldum
-# ve kodu bir bir her model icin parelel olarak calistirdim
-custom_model_names = [
-    "dbmdz/bert-base-turkish-cased"
-]
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Evaluate paired-row retrieval using Turkish BERT CLS embeddings.")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--csv", type=Path, help="Reuse all paired rows from a Question,Answer CSV.")
+    source.add_argument("--dataset", default=DATASET_NAME, help="Hugging Face dataset to sample.")
+    parser.add_argument("--split", default="train")
+    parser.add_argument("--dataset-revision", help="Dataset revision; use a commit hash for reproducibility.")
+    parser.add_argument("--sample-size", type=int, default=1000, help="Number of dataset rows to sample; ignored with --csv.")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-csv", type=Path, help="Save the exact evaluated question and answer pairs.")
+    parser.add_argument("--model", default=MODEL_NAME)
+    parser.add_argument("--model-revision", help="Model revision; use a commit hash for reproducibility.")
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--local-files-only", action="store_true", help="Load the model and tokenizer only from local cache.")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--output-json", type=Path)
+    parser.add_argument("--plot", type=Path, help="Save an optional t-SNE plot; adds computation.")
+    args = parser.parse_args(argv)
+    sizes = [args.batch_size, args.max_length, args.top_k]
+    if args.csv is None:
+        sizes.append(args.sample_size)
+    if min(sizes) <= 0:
+        parser.error("Sample size, batch size, maximum length and top-k must be positive.")
+    model_revision = _asset_revision(args.model, args.model_revision, MODEL_NAME, MODEL_REVISION)
+    if args.csv:
+        questions, answers = load_question_answer_csv(args.csv)
+        data_source = {"csv": str(args.csv)}
+    else:
+        dataset_revision = _asset_revision(args.dataset, args.dataset_revision, DATASET_NAME, DATASET_REVISION)
+        from datasets import load_dataset
 
-# her model için top-1 ve top-5 başarı oranlarını hesaplayalım
-results = {}
-for model_name in custom_model_names:
-    print(f"Model: {model_name} yükleniyor...")
-    tokenizer, model = get_model_and_tokenizer(model_name)
+        dataset = load_dataset(args.dataset, split=args.split, revision=dataset_revision)
+        questions, answers = select_question_answer_pairs(dataset, args.sample_size, args.seed)
+        data_source = {"dataset": args.dataset, "split": args.split, "revision": dataset_revision}
+    if args.save_csv:
+        save_question_answer_csv(args.save_csv, questions, answers)
+    import torch
 
-    print(f"{model_name} için top-1 ve top-5 başarı oranları hesaplanıyor...")
-    top1_rate, top5_rate = calculate_top_k_success(selected_questions, selected_answers, tokenizer, model)
-
-    results[model_name] = {
-        "top1": top1_rate,
-        "top5": top5_rate
+    torch.manual_seed(args.seed)
+    tokenizer, model = get_model_and_tokenizer(args.model, args.device, model_revision, args.local_files_only)
+    question_embeddings = get_embeddings_in_batches(questions, tokenizer, model, args.batch_size, args.max_length)
+    answer_embeddings = get_embeddings_in_batches(answers, tokenizer, model, args.batch_size, args.max_length)
+    top1, topk = evaluate_embeddings(question_embeddings, answer_embeddings, args.top_k, args.batch_size)
+    pairs_json = json.dumps(list(zip(questions, answers)), ensure_ascii=False, separators=(",", ":"))
+    result = {
+        "model": args.model, "model_revision": getattr(model.config, "_commit_hash", None) or model_revision,
+        "data_source": data_source, "pairs_sha256": hashlib.sha256(pairs_json.encode("utf-8")).hexdigest(),
+        "sample_size": len(questions), "seed": args.seed, "device": str(model.device), "pooling": "CLS",
+        "max_length": min(args.max_length, tokenizer.model_max_length, model.config.max_position_embeddings),
+        "top_k": min(args.top_k, len(answers)), "top1": top1, "topk": topk,
     }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.output_json:
+        args.output_json.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.plot:
+        import numpy as np
 
-    print(f"{model_name} - Top-1 Başarı Oranı: {top1_rate:.2%}, Top-5 Başarı Oranı: {top5_rate:.2%}\n")
+        all_embeddings = np.vstack((question_embeddings.numpy(), answer_embeddings.numpy()))
+        labels = ["question"] * len(questions) + ["answer"] * len(answers)
+        plot_tsne(all_embeddings, labels, f"{args.model} t-SNE", args.plot)
+    return 0
 
-# sonuclari yazdırma
-print("Tüm modellerin başarı oranları:")
-for model, scores in results.items():
-    print(f"{model} - Top-1: {scores['top1']:.2%}, Top-5: {scores['top5']:.2%}")
 
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-
-# t-SNE uygulayarak gorsellestirdim
-def plot_tsne(embeddings, labels, title):
-    tsne = TSNE(n_components=2, random_state=42)
-    reduced_embeddings = tsne.fit_transform(embeddings)
-    colors = ['blue' if label == 'question' else 'red' for label in labels]
-    plt.figure(figsize=(10, 8))
-    plt.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1], c=colors, alpha=0.5)
-    plt.title(title)
-    plt.xlabel('t-SNE Dim 1')
-    plt.ylabel('t-SNE Dim 2')
-    plt.show()
-
-for model_name in custom_model_names:
-    print(f"{model_name} için t-SNE görselleştirmesi oluşturuluyor...")
-    tokenizer, model = get_model_and_tokenizer(model_name)
-
-    # embedding alma
-    question_embeddings = get_embeddings_in_batches(selected_questions, tokenizer, model).numpy()
-    answer_embeddings = get_embeddings_in_batches(selected_answers, tokenizer, model).numpy()
-
-    # t-SNE icin verileri birlestirme
-    all_embeddings = np.vstack((question_embeddings, answer_embeddings))
-    labels = ['question'] * len(selected_questions) + ['answer'] * len(selected_answers)
-
-    # gorsellestirme
-    plot_tsne(all_embeddings, labels, f"{model_name} t-SNE Visualization")
+if __name__ == "__main__":
+    raise SystemExit(main())

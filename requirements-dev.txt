@@ -1,0 +1,4 @@
+-r requirements.txt
+bandit>=1.9.4,<2
+pip>=25.3,<27
+pip-audit>=2.9,<3

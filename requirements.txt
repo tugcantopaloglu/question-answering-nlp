@@ -1,0 +1,5 @@
+datasets>=5.0.1,<6
+fsspec>=2026.6.0,<2027
+numpy>=1.26,<3
+torch>=2.6,<3
+transformers>=5.10,<6
