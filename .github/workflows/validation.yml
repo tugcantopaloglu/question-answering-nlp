@@ -35,3 +35,17 @@ jobs:
         run: python -m bandit ana_kod_tugcantopaloglu.py --skip B311
       - name: Audit installed dependencies
         run: python -m pip_audit --progress-spinner off
+      - name: Audit upstream PyTorch release for CPU build
+        run: |
+          python - <<'PY'
+          import os
+          from importlib.metadata import version
+          from pathlib import Path
+
+          installed = version("torch")
+          release = installed.split("+", 1)[0]
+          path = Path(os.environ["RUNNER_TEMP"]) / "torch-release-audit.txt"
+          path.write_text(f"torch=={release}\n", encoding="utf-8")
+          print(f"Auditing upstream torch {release} for installed build {installed}")
+          PY
+          python -m pip_audit --progress-spinner off --disable-pip --no-deps -r "$RUNNER_TEMP/torch-release-audit.txt"

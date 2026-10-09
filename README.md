@@ -76,6 +76,8 @@ Tests create a tiny randomly initialized BERT and Turkish tokenizer entirely in 
 
 Bandit's B311 rule is excluded explicitly because the seeded pseudo-random generator selects reproducible research rows and is not used for security tokens or cryptography. Other Bandit checks remain enabled, including checks for unsafe Hub downloads.
 
+The Setuptools floor also applies after installing CPU PyTorch wheels, whose package index may otherwise provide an older bootstrap version. The CPU wheel's local version tag, such as `+cpu`, has no matching PyPI release for `pip-audit`; CI reports this and separately queries advisories for the installed wheel's upstream PyTorch version without installing another wheel or resolving dependencies.
+
 ## License
 
 The project is distributed under the [MIT license](LICENSE). The referenced datasets and pretrained models retain their own terms and attribution.
